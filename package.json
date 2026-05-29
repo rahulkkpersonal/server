@@ -1,15 +1,46 @@
 {
-  "name": "signaling-server",
+  "name": "streamlink",
   "version": "1.0.0",
+  "private": true,
+  "description": "Peer-to-peer MP4 video streaming over WebRTC DataChannels with Socket.IO signaling.",
   "scripts": {
-    "signaling:build": "tsc",
-    "signaling:start": "node dist/signaling.js"
+    "dev": "concurrently -k -n next,signaling -c cyan,green \"next dev -p 3000\" \"tsx watch server/signaling.ts\"",
+    "dev:next": "next dev -p 3000",
+    "dev:signaling": "tsx watch server/signaling.ts",
+    "build": "next build && tsc -p tsconfig.server.json --noEmit",
+    "start": "next start -p 3000",
+    "signaling:build": "tsc -p tsconfig.server.json",
+    "signaling:start": "node dist/server/signaling.js",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "lint": "next lint"
   },
   "dependencies": {
-    "express": "^4.21.0",
-    "socket.io": "^4.8.0"
+    "@next/env": "^15.0.0",
+    "framer-motion": "^12.23.24",
+    "lucide-react": "^0.468.0",
+    "next": "^15.0.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "zustand": "^5.0.2"
   },
   "devDependencies": {
-    "typescript": "^5.8.0"
+    "@types/node": "^22.10.2",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^19.0.1",
+    "@types/react-dom": "^19.0.2",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.0",
+    "eslint": "^9.17.0",
+    "eslint-config-next": "^15.0.0",
+    "postcss": "^8.5.10",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "overrides": {
+    "postcss": "^8.5.10"
   }
 }
