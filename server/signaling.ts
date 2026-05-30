@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { Server, type Socket } from "socket.io";
 
 type Room = {
-  hostId: string;
+  hostId?: string;
   viewerId?: string;
   createdAt: number;
   file?: {
@@ -113,7 +113,7 @@ const httpServer = createServer((req, res) => {
         try {
           while (currentOffset <= end && !req.destroyed) {
             const readSize = Math.min(256 * 1024, end - currentOffset + 1); // 256KB chunks
-            const chunk = await requestChunkFromHost(room.hostId, currentOffset, readSize);
+            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
             res.write(chunk);
             currentOffset += readSize;
           }
@@ -139,7 +139,7 @@ const httpServer = createServer((req, res) => {
         try {
           while (currentOffset < fileSize && !req.destroyed) {
             const readSize = Math.min(256 * 1024, fileSize - currentOffset);
-            const chunk = await requestChunkFromHost(room.hostId, currentOffset, readSize);
+            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
             res.write(chunk);
             currentOffset += readSize;
           }
@@ -195,9 +195,9 @@ io.on("connection", (socket) => {
 
   socket.on("room:create", (ack: (response: { roomId: string }) => void) => {
     const roomId = createRoomId();
-    rooms.set(roomId, { hostId: socket.id, createdAt: Date.now() });
-    bindSocket(socket, roomId, "host");
-    console.log(`[ROOM CREATE] Host ${socket.id} created room ${roomId}`);
+    rooms.set(roomId, { hostId: "", viewerId: socket.id, createdAt: Date.now() });
+    bindSocket(socket, roomId, "viewer");
+    console.log(`[ROOM CREATE] Viewer (Creator) ${socket.id} created room ${roomId}`);
     ack({ roomId });
   });
 
@@ -210,31 +210,35 @@ io.on("connection", (socket) => {
       const roomId = payload.roomId.toUpperCase();
       console.log(`[ROOM RESTORE REQUEST] Socket ${socket.id} attempting to restore as ${payload.role} in room ${roomId}`);
 
-      if (payload.role === "host") {
-        rooms.set(roomId, { hostId: socket.id, createdAt: Date.now() });
-        bindSocket(socket, roomId, "host");
-        console.log(`[ROOM RESTORE SUCCESS] Host ${socket.id} restored room ${roomId}`);
+      const room = rooms.get(roomId);
+
+      if (payload.role === "viewer") {
+        rooms.set(roomId, { hostId: room?.hostId || "", viewerId: socket.id, createdAt: Date.now(), file: room?.file });
+        bindSocket(socket, roomId, "viewer");
+        console.log(`[ROOM RESTORE SUCCESS] Viewer ${socket.id} restored room ${roomId}`);
         ack({ ok: true });
         return;
       }
 
-      const room = rooms.get(roomId);
       if (!room) {
-        console.log(`[ROOM RESTORE FAIL] Room ${roomId} not found for viewer ${socket.id}`);
+        console.log(`[ROOM RESTORE FAIL] Room ${roomId} not found for host ${socket.id}`);
         ack({ ok: false, error: "Room is no longer available." });
         return;
       }
 
-      if (room.viewerId && room.viewerId !== socket.id) {
-        console.log(`[ROOM RESTORE FAIL] Room ${roomId} already has another viewer (${room.viewerId}) instead of ${socket.id}`);
-        ack({ ok: false, error: "This room already has a viewer." });
+      if (room.hostId && room.hostId !== socket.id) {
+        console.log(`[ROOM RESTORE FAIL] Room ${roomId} already has another host (${room.hostId}) instead of ${socket.id}`);
+        ack({ ok: false, error: "This room already has a host." });
         return;
       }
 
-      room.viewerId = socket.id;
-      bindSocket(socket, roomId, "viewer");
-      console.log(`[ROOM RESTORE SUCCESS] Viewer ${socket.id} restored connection in room ${roomId}`);
-      io.to(room.hostId).emit("peer:joined", { viewerId: socket.id });
+      room.hostId = socket.id;
+      bindSocket(socket, roomId, "host");
+      console.log(`[ROOM RESTORE SUCCESS] Host ${socket.id} restored connection in room ${roomId}`);
+      if (room.viewerId) {
+        io.to(room.viewerId).emit("peer:joined", { hostId: socket.id });
+        socket.emit("peer:joined", { viewerId: room.viewerId });
+      }
       ack({ ok: true });
     },
   );
@@ -247,24 +251,28 @@ io.on("connection", (socket) => {
     ) => {
       const roomId = payload.roomId.toUpperCase();
       const room = rooms.get(roomId);
-      console.log(`[ROOM JOIN REQUEST] Viewer ${socket.id} requesting to join room ${roomId}`);
+      console.log(`[ROOM JOIN REQUEST] Host ${socket.id} requesting to join room ${roomId}`);
 
       if (!room) {
-        console.log(`[ROOM JOIN FAIL] Room ${roomId} not found for viewer ${socket.id}`);
+        console.log(`[ROOM JOIN FAIL] Room ${roomId} not found for host ${socket.id}`);
         ack({ ok: false, error: "Room not found. Check the invite code." });
         return;
       }
 
-      if (room.viewerId && room.viewerId !== socket.id) {
-        console.log(`[ROOM JOIN FAIL] Room ${roomId} already occupied by viewer ${room.viewerId} (requested by ${socket.id})`);
-        ack({ ok: false, error: "This room already has a viewer." });
+      if (room.hostId && room.hostId !== socket.id) {
+        console.log(`[ROOM JOIN FAIL] Room ${roomId} already occupied by host ${room.hostId} (requested by ${socket.id})`);
+        ack({ ok: false, error: "This room already has a host." });
         return;
       }
 
-      room.viewerId = socket.id;
-      bindSocket(socket, roomId, "viewer");
-      console.log(`[ROOM JOIN SUCCESS] Viewer ${socket.id} joined room ${roomId}`);
-      io.to(room.hostId).emit("peer:joined", { viewerId: socket.id });
+      room.hostId = socket.id;
+      bindSocket(socket, roomId, "host");
+      console.log(`[ROOM JOIN SUCCESS] Host ${socket.id} joined room ${roomId}`);
+      
+      if (room.viewerId) {
+        io.to(room.viewerId).emit("peer:joined", { hostId: socket.id });
+        socket.emit("peer:joined", { viewerId: room.viewerId });
+      }
       ack({ ok: true });
     },
   );
@@ -289,11 +297,13 @@ io.on("connection", (socket) => {
       return;
     }
     console.log(`[ANSWER FORWARD] Forwarding WebRTC answer from viewer ${socket.id} to host ${room.hostId} for room ${payload.roomId}`);
-    io.to(room.hostId).emit("webrtc:answer", {
-      from: socket.id,
-      roomId: payload.roomId,
-      sdp: payload.sdp,
-    });
+    if (room.hostId) {
+      io.to(room.hostId).emit("webrtc:answer", {
+        from: socket.id,
+        roomId: payload.roomId,
+        sdp: payload.sdp,
+      });
+    }
   });
 
   socket.on("webrtc:candidate", (payload: SignalPayload) => {
@@ -326,8 +336,10 @@ io.on("connection", (socket) => {
     }
 
     console.log(`[PEER RECONNECT] Reconnection request from ${socket.data.role} ${socket.id} for room ${payload.roomId}`);
-    if (socket.data.role === "viewer") {
+    if (socket.data.role === "viewer" && room.hostId) {
       io.to(room.hostId).emit("peer:joined", { viewerId: socket.id });
+    } else if (socket.data.role === "host" && room.viewerId) {
+      io.to(room.viewerId).emit("peer:joined", { hostId: socket.id });
     }
   });
 
@@ -356,17 +368,19 @@ io.on("connection", (socket) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    if (role === "host" && room.hostId === socket.id) {
-      console.log(`[ROOM CLOSE] Host disconnected. Closing room ${roomId}`);
+    if (role === "viewer" && room.viewerId === socket.id) {
+      console.log(`[ROOM CLOSE] Viewer (Creator) disconnected. Closing room ${roomId}`);
       io.to(roomName(roomId)).emit("room:closed");
       rooms.delete(roomId);
       return;
     }
 
-    if (role === "viewer" && room.viewerId === socket.id) {
-      console.log(`[ROOM LEAVE] Viewer disconnected from room ${roomId}`);
-      room.viewerId = undefined;
-      io.to(room.hostId).emit("peer:left");
+    if (role === "host" && room.hostId === socket.id) {
+      console.log(`[ROOM LEAVE] Host disconnected from room ${roomId}`);
+      room.hostId = undefined;
+      if (room.viewerId) {
+        io.to(room.viewerId).emit("peer:left");
+      }
     }
   });
 });
