@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
+// @ts-ignore
 import ffmpegPath from "ffmpeg-static";
 import { Server, type Socket } from "socket.io";
 
