@@ -1,10 +1,16 @@
 import { createServer } from "node:http";
+import { EventEmitter } from "node:events";
 import { Server, type Socket } from "socket.io";
 
 type Room = {
   hostId: string;
   viewerId?: string;
   createdAt: number;
+  file?: {
+    name: string;
+    size: number;
+    mimeType: string;
+  };
 };
 
 type SessionDescription = {
@@ -30,7 +36,133 @@ const port = Number(process.env.PORT ?? process.env.SIGNALING_PORT ?? 4000);
 const clientOrigin = process.env.CLIENT_ORIGIN ?? "http://localhost:3000";
 const rooms = new Map<string, Room>();
 
-const httpServer = createServer();
+const chunkEmitter = new EventEmitter();
+chunkEmitter.setMaxListeners(100);
+
+function requestChunkFromHost(hostSocketId: string, offset: number, size: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+    const onChunk = (chunk: any) => {
+      clearTimeout(timer);
+      resolve(Buffer.from(chunk));
+    };
+
+    chunkEmitter.once(requestId, onChunk);
+
+    const timer = setTimeout(() => {
+      chunkEmitter.off(requestId, onChunk);
+      reject(new Error("Timeout waiting for chunk from host"));
+    }, 15000);
+
+    io.to(hostSocketId).emit("stream:request-chunk", { offset, size, requestId });
+  });
+}
+
+const httpServer = createServer((req, res) => {
+  const url = req.url || "";
+
+  if (url.startsWith("/stream/")) {
+    const roomId = url.split("/")[2]?.toUpperCase();
+    const room = rooms.get(roomId);
+
+    if (!room || !room.file) {
+      res.writeHead(404, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+      res.end("Room or file not found.");
+      return;
+    }
+
+    const file = room.file;
+    const fileSize = file.size;
+    const range = req.headers.range;
+
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Range");
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(200);
+      res.end();
+      return;
+    }
+
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+      if (start >= fileSize || end >= fileSize) {
+        res.writeHead(416, {
+          "Content-Range": `bytes */${fileSize}`,
+          "Access-Control-Allow-Origin": "*"
+        });
+        res.end();
+        return;
+      }
+
+      const chunksize = end - start + 1;
+      res.writeHead(206, {
+        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunksize,
+        "Content-Type": file.mimeType,
+      });
+
+      let currentOffset = start;
+      const streamChunks = async () => {
+        try {
+          while (currentOffset <= end && !req.destroyed) {
+            const readSize = Math.min(256 * 1024, end - currentOffset + 1); // 256KB chunks
+            const chunk = await requestChunkFromHost(room.hostId, currentOffset, readSize);
+            res.write(chunk);
+            currentOffset += readSize;
+          }
+          res.end();
+        } catch (err) {
+          console.error(`[STREAM ERROR] Error streaming range to client:`, err);
+          if (!res.headersSent) {
+            res.writeHead(500);
+          }
+          res.end();
+        }
+      };
+      void streamChunks();
+    } else {
+      res.writeHead(200, {
+        "Content-Length": fileSize,
+        "Content-Type": file.mimeType,
+        "Accept-Ranges": "bytes",
+      });
+
+      let currentOffset = 0;
+      const streamAll = async () => {
+        try {
+          while (currentOffset < fileSize && !req.destroyed) {
+            const readSize = Math.min(256 * 1024, fileSize - currentOffset);
+            const chunk = await requestChunkFromHost(room.hostId, currentOffset, readSize);
+            res.write(chunk);
+            currentOffset += readSize;
+          }
+          res.end();
+        } catch (err) {
+          console.error(`[STREAM ERROR] Error streaming full file to client:`, err);
+          if (!res.headersSent) {
+            res.writeHead(500);
+          }
+          res.end();
+        }
+      };
+      void streamAll();
+    }
+    return;
+  }
+
+  if (!url.startsWith("/socket.io/")) {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not Found");
+  }
+});
+
 const io = new Server(httpServer, {
   cors: {
     origin: clientOrigin.split(",").map((origin) => origin.trim()),
@@ -199,6 +331,22 @@ io.on("connection", (socket) => {
     }
   });
 
+  socket.on(
+    "room:register-file",
+    (payload: { roomId: string; file: { name: string; size: number; mimeType: string } }) => {
+      const roomId = payload.roomId.toUpperCase();
+      const room = rooms.get(roomId);
+      if (room && room.hostId === socket.id) {
+        room.file = payload.file;
+        console.log(`[FILE REGISTER] Room ${roomId} registered file: ${payload.file.name} (${payload.file.size} bytes)`);
+      }
+    }
+  );
+
+  socket.on("stream:respond-chunk", (payload: { requestId: string; chunk: any }) => {
+    chunkEmitter.emit(payload.requestId, payload.chunk);
+  });
+
   socket.on("disconnect", () => {
     const roomId = socket.data.roomId as string | undefined;
     const role = socket.data.role as "host" | "viewer" | undefined;
@@ -226,3 +374,5 @@ io.on("connection", (socket) => {
 httpServer.listen(port, () => {
   console.log(`StreamLink signaling server listening on :${port}`);
 });
+
+// --
