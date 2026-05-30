@@ -1,8 +1,5 @@
 import { createServer } from "node:http";
 import { EventEmitter } from "node:events";
-import { spawn } from "node:child_process";
-// @ts-ignore
-import ffmpegPath from "ffmpeg-static";
 import { Server, type Socket } from "socket.io";
 
 type Room = {
@@ -62,12 +59,6 @@ function requestChunkFromHost(hostSocketId: string, offset: number, size: number
   });
 }
 
-function isBrowserPlayable(filename: string | undefined): boolean {
-  if (!filename) return true;
-  const ext = filename.substring(filename.lastIndexOf(".")).toLowerCase();
-  return [".mp4", ".webm", ".ogg"].includes(ext);
-}
-
 const httpServer = createServer((req, res) => {
   const url = req.url || "";
 
@@ -83,6 +74,7 @@ const httpServer = createServer((req, res) => {
 
     const file = room.file;
     const fileSize = file.size;
+    const range = req.headers.range;
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -93,98 +85,6 @@ const httpServer = createServer((req, res) => {
       res.end();
       return;
     }
-
-    if (!isBrowserPlayable(file.name)) {
-      console.log(`[FFMPEG STREAM] Spawning FFmpeg to transcode/remux non-playable format: ${file.name}`);
-      res.writeHead(200, {
-        "Content-Type": "video/mp4",
-        "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Range",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-      });
-
-      const ffmpegArgs = [
-        "-i", "pipe:0",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-f", "mp4",
-        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-        "pipe:1"
-      ];
-
-      const ffmpegBinary = ffmpegPath || "ffmpeg";
-      const ffmpeg = spawn(ffmpegBinary, ffmpegArgs);
-
-      ffmpeg.stdout.pipe(res);
-
-      let ffmpegKilled = false;
-      const killFfmpeg = () => {
-        if (ffmpegKilled) return;
-        ffmpegKilled = true;
-        try {
-          console.log(`[FFMPEG KILL] Terminating FFmpeg process for room ${roomId}...`);
-          ffmpeg.kill("SIGKILL");
-        } catch (err) {
-          console.warn("[FFMPEG KILL ERROR]", err);
-        }
-      };
-
-      req.on("close", () => {
-        killFfmpeg();
-      });
-
-      const writeToStdin = async () => {
-        let offset = 0;
-        const CHUNK_SIZE = 512 * 1024; // 512KB chunks
-        try {
-          while (offset < fileSize && !ffmpeg.stdin.destroyed && !req.destroyed && !ffmpegKilled) {
-            const size = Math.min(CHUNK_SIZE, fileSize - offset);
-            const chunk = await requestChunkFromHost(room.hostId, offset, size);
-
-            if (ffmpeg.stdin.destroyed || req.destroyed || ffmpegKilled) break;
-
-            const canWrite = ffmpeg.stdin.write(chunk);
-            if (!canWrite) {
-              await new Promise<void>((resolve) => {
-                ffmpeg.stdin.once("drain", resolve);
-                ffmpeg.stdin.once("close", resolve);
-              });
-            }
-
-            offset += size;
-          }
-        } catch (err) {
-          console.error("[FFMPEG STDIN ERROR]", err);
-        } finally {
-          try {
-            ffmpeg.stdin.end();
-          } catch {}
-        }
-      };
-
-      void writeToStdin();
-
-      ffmpeg.on("exit", (code, signal) => {
-        console.log(`[FFMPEG EXIT] FFmpeg process exited with code ${code} and signal ${signal}`);
-        res.end();
-      });
-
-      ffmpeg.on("error", (err) => {
-        console.error("[FFMPEG SPAWN ERROR]", err);
-        killFfmpeg();
-        if (!res.headersSent) {
-          res.writeHead(500, { "Content-Type": "text/plain" });
-          res.end("Transcoding failed.");
-        } else {
-          res.end();
-        }
-      });
-      return;
-    }
-
-    const range = req.headers.range;
 
     if (range) {
       const parts = range.replace(/bytes=/, "").split("-");
