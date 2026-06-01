@@ -1,7 +1,5 @@
 import { createServer } from "node:http";
 import { EventEmitter } from "node:events";
-import { spawn } from "node:child_process";
-import ffmpegPath from "ffmpeg-static";
 import { Server, type Socket } from "socket.io";
 
 type Room = {
@@ -41,37 +39,19 @@ const rooms = new Map<string, Room>();
 const chunkEmitter = new EventEmitter();
 chunkEmitter.setMaxListeners(100);
 
-function requestChunkFromHost(
-  hostSocketId: string,
-  offset: number,
-  size: number,
-  req: any
-): Promise<Buffer> {
+function requestChunkFromHost(hostSocketId: string, offset: number, size: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    if (req.destroyed) {
-      return reject(new Error("Request already destroyed"));
-    }
-
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
     const onChunk = (chunk: any) => {
-      req.off("close", onClose);
       clearTimeout(timer);
       resolve(Buffer.from(chunk));
     };
 
-    const onClose = () => {
-      chunkEmitter.off(requestId, onChunk);
-      clearTimeout(timer);
-      reject(new Error("Client connection closed"));
-    };
-
     chunkEmitter.once(requestId, onChunk);
-    req.once("close", onClose);
 
     const timer = setTimeout(() => {
       chunkEmitter.off(requestId, onChunk);
-      req.off("close", onClose);
       reject(new Error("Timeout waiting for chunk from host"));
     }, 15000);
 
@@ -106,91 +86,6 @@ const httpServer = createServer((req, res) => {
       return;
     }
 
-    const nonNativeContainers = [".mkv", ".avi", ".flv", ".wmv", ".ts", ".mov", ".mpg", ".mpeg", ".hevc"];
-    const isNonNative = file.name && nonNativeContainers.some(ext => file.name.toLowerCase().endsWith(ext));
-
-    if (isNonNative) {
-      if (!ffmpegPath) {
-        console.error("[TRANSCODE ERROR] ffmpeg-static path is not found.");
-        res.writeHead(500, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
-        res.end("Transcoding service not available.");
-        return;
-      }
-
-      res.writeHead(200, {
-        "Content-Type": "video/mp4",
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff",
-      });
-
-      console.log(`[TRANSCODE START] Spawning FFmpeg to remux/transcode non-native file: ${file.name}`);
-
-      const ffmpeg = spawn(ffmpegPath, [
-        "-i", "pipe:0", // Read input from stdin
-        "-c:v", "copy", // Copy video track (highly efficient!)
-        "-c:a", "aac",  // Transcode audio to AAC (highly compatible)
-        "-b:a", "128k", // Audio bitrate
-        "-ac", "2",     // Stereo audio
-        "-f", "mp4",    // Fragmented MP4 output format
-        "-movflags", "empty_moov+omit_tfhd_offset+frag_keyframe+default_base_moof", // Streamable MP4 flags
-        "pipe:1"        // Write output to stdout
-      ]);
-
-      ffmpeg.stdout.pipe(res);
-
-      ffmpeg.on("error", (err) => {
-        console.error("[FFMPEG PROCESS ERROR]", err);
-        if (!res.headersSent) {
-          res.writeHead(500);
-        }
-        res.end();
-      });
-
-      let currentOffset = 0;
-      let isFeederRunning = true;
-
-      const feedFfmpeg = async () => {
-        try {
-          while (currentOffset < fileSize && !req.destroyed && isFeederRunning) {
-            if (!ffmpeg.stdin.writable) {
-              console.log("[TRANSCODE FEED] FFmpeg stdin is no longer writable.");
-              break;
-            }
-
-            const readSize = Math.min(256 * 1024, fileSize - currentOffset);
-            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize, req);
-
-            const canWrite = ffmpeg.stdin.write(chunk);
-            if (!canWrite) {
-              await new Promise<void>((resolve) => {
-                ffmpeg.stdin.once("drain", resolve);
-              });
-            }
-
-            currentOffset += readSize;
-          }
-          if (ffmpeg.stdin.writable) {
-            ffmpeg.stdin.end();
-          }
-        } catch (err) {
-          console.error("[TRANSCODE FEED ERROR]", err);
-          isFeederRunning = false;
-          ffmpeg.kill();
-          res.end();
-        }
-      };
-
-      void feedFfmpeg();
-
-      req.on("close", () => {
-        console.log("[TRANSCODE END] Client closed connection. Killing FFmpeg process.");
-        isFeederRunning = false;
-        ffmpeg.kill();
-      });
-
-      return;
-    }
-
     if (range) {
       const parts = range.replace(/bytes=/, "").split("-");
       const start = parseInt(parts[0], 10);
@@ -218,7 +113,7 @@ const httpServer = createServer((req, res) => {
         try {
           while (currentOffset <= end && !req.destroyed) {
             const readSize = Math.min(256 * 1024, end - currentOffset + 1); // 256KB chunks
-            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize, req);
+            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
             res.write(chunk);
             currentOffset += readSize;
           }
@@ -244,7 +139,7 @@ const httpServer = createServer((req, res) => {
         try {
           while (currentOffset < fileSize && !req.destroyed) {
             const readSize = Math.min(256 * 1024, fileSize - currentOffset);
-            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize, req);
+            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
             res.write(chunk);
             currentOffset += readSize;
           }
@@ -474,25 +369,17 @@ io.on("connection", (socket) => {
     if (!room) return;
 
     if (role === "viewer" && room.viewerId === socket.id) {
-      room.viewerId = undefined;
-      console.log(`[ROOM LEAVE] Viewer disconnected from room ${roomId}`);
-      if (room.hostId) {
-        io.to(room.hostId).emit("peer:left");
-      } else {
-        console.log(`[ROOM CLOSE] No peers left. Deleting room ${roomId}`);
-        rooms.delete(roomId);
-      }
+      console.log(`[ROOM CLOSE] Viewer (Creator) disconnected. Closing room ${roomId}`);
+      io.to(roomName(roomId)).emit("room:closed");
+      rooms.delete(roomId);
       return;
     }
 
     if (role === "host" && room.hostId === socket.id) {
-      room.hostId = undefined;
       console.log(`[ROOM LEAVE] Host disconnected from room ${roomId}`);
+      room.hostId = undefined;
       if (room.viewerId) {
         io.to(room.viewerId).emit("peer:left");
-      } else {
-        console.log(`[ROOM CLOSE] No peers left. Deleting room ${roomId}`);
-        rooms.delete(roomId);
       }
     }
   });
