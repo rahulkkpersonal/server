@@ -1,5 +1,7 @@
 import { createServer } from "node:http";
 import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
+import path from "node:path";
 import { Server, type Socket } from "socket.io";
 
 type Room = {
@@ -33,12 +35,54 @@ type SignalPayload = {
 };
 
 const port = Number(process.env.PORT ?? process.env.SIGNALING_PORT ?? 4000);
-const clientOrigin = process.env.CLIENT_ORIGIN ?? "http://localhost:3000";
+const clientOrigin = process.env.CLIENT_ORIGIN ?? "*";
 const rooms = new Map<string, Room>();
 
 const chunkEmitter = new EventEmitter();
 chunkEmitter.setMaxListeners(100);
 
+// ───────────── TURN credential configuration ─────────────
+function getTurnServers(): Array<{ urls: string | string[]; username?: string; credential?: string }> {
+  const turnUrl = process.env.TURN_URL || process.env.NEXT_PUBLIC_TURN_URL;
+  if (turnUrl) {
+    return [
+      {
+        urls: turnUrl.split(",").map((url) => url.trim()).filter(Boolean),
+        username: process.env.TURN_USERNAME || process.env.NEXT_PUBLIC_TURN_USERNAME || "",
+        credential: process.env.TURN_PASSWORD || process.env.NEXT_PUBLIC_TURN_PASSWORD || "",
+      },
+    ];
+  }
+  // No external TURN configured — relay will handle cross-network
+  return [];
+}
+
+// ───────────── FFmpeg path resolution ─────────────
+let ffmpegPath = "ffmpeg";
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  ffmpegPath = require("ffmpeg-static") as string;
+} catch {
+  // ffmpeg-static not available, try system ffmpeg
+}
+
+/** Check if a file format needs remuxing for browser playback */
+function needsRemux(mimeType: string): boolean {
+  const nonBrowserTypes = [
+    "video/x-matroska",
+    "video/x-msvideo",
+    "video/x-ms-wmv",
+    "video/x-flv",
+    "video/quicktime",
+    "video/hevc",
+    "video/mpeg",
+    "video/mp2t",
+    "video/octet-stream",
+  ];
+  return nonBrowserTypes.includes(mimeType);
+}
+
+// ───────────── Chunk request from host ─────────────
 function requestChunkFromHost(hostSocketId: string, offset: number, size: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -55,30 +99,97 @@ function requestChunkFromHost(hostSocketId: string, offset: number, size: number
       reject(new Error("Timeout waiting for chunk from host"));
     }, 15000);
 
+    // Verify the host socket is still connected before requesting
+    const hostSocket = io.sockets.sockets.get(hostSocketId);
+    if (!hostSocket || !hostSocket.connected) {
+      clearTimeout(timer);
+      chunkEmitter.off(requestId, onChunk);
+      reject(new Error("Host is not connected"));
+      return;
+    }
+
     io.to(hostSocketId).emit("stream:request-chunk", { offset, size, requestId });
   });
 }
 
+// ───────────── CORS helper ─────────────
+function setCorsHeaders(res: import("node:http").ServerResponse, req: import("node:http").IncomingMessage) {
+  const origin = req.headers.origin || "*";
+  if (clientOrigin === "*") {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else {
+    const allowed = clientOrigin.split(",").map((o) => o.trim());
+    if (allowed.includes(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+    } else {
+      // For stream endpoints, allow any origin so cross-network devices can access
+      res.setHeader("Access-Control-Allow-Origin", origin);
+    }
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Range, Content-Type");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+}
+
+// ───────────── HTTP Server ─────────────
 const httpServer = createServer((req, res) => {
   const url = req.url || "";
 
+  // ── TURN credentials endpoint ──
+  if (url === "/turn-credentials" || url === "/turn-credentials/") {
+    setCorsHeaders(res, req);
+    if (req.method === "OPTIONS") {
+      res.writeHead(200);
+      res.end();
+      return;
+    }
+    const turnServers = getTurnServers();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ iceServers: turnServers }));
+    return;
+  }
+
+  // ── Health check ──
+  if (url === "/health" || url === "/health/") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
+    return;
+  }
+
+  // ── Stream endpoint ──
   if (url.startsWith("/stream/")) {
-    const roomId = url.split("/")[2]?.toUpperCase();
+    const roomId = url.split("/")[2]?.split("?")[0]?.toUpperCase();
     const room = rooms.get(roomId);
 
     if (!room || !room.file) {
-      res.writeHead(404, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+      setCorsHeaders(res, req);
+      res.writeHead(404, { "Content-Type": "text/plain" });
       res.end("Room or file not found.");
+      return;
+    }
+
+    if (!room.hostId) {
+      setCorsHeaders(res, req);
+      res.writeHead(503, { "Content-Type": "text/plain" });
+      res.end("Host is not connected. Please wait for the host to join.");
+      return;
+    }
+
+    // Verify host is actually connected
+    const hostSocket = io.sockets.sockets.get(room.hostId);
+    if (!hostSocket || !hostSocket.connected) {
+      setCorsHeaders(res, req);
+      res.writeHead(503, { "Content-Type": "text/plain" });
+      res.end("Host is not currently online.");
       return;
     }
 
     const file = room.file;
     const fileSize = file.size;
     const range = req.headers.range;
+    const shouldRemux = needsRemux(file.mimeType);
 
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Range");
+    setCorsHeaders(res, req);
 
     if (req.method === "OPTIONS") {
       res.writeHead(200);
@@ -86,6 +197,140 @@ const httpServer = createServer((req, res) => {
       return;
     }
 
+    // ── If the format needs remuxing (MKV, AVI, etc.) → pipe through FFmpeg ──
+    if (shouldRemux) {
+      console.log(`[STREAM REMUX] Remuxing ${file.name} (${file.mimeType}) to WebM for browser playback`);
+
+      res.writeHead(200, {
+        "Content-Type": "video/webm",
+        "Accept-Ranges": "none",
+        "Transfer-Encoding": "chunked",
+        "Cache-Control": "no-store",
+      });
+
+      // Spawn FFmpeg to remux from input format to WebM (fast remux, no re-encode if possible)
+      const ffmpeg = spawn(ffmpegPath, [
+        "-i", "pipe:0",           // Read from stdin
+        "-c:v", "copy",           // Try to copy video codec first
+        "-c:a", "opus",           // Transcode audio to opus (WebM compatible)
+        "-f", "webm",             // Output WebM format
+        "-movflags", "+faststart",
+        "-deadline", "realtime",
+        "-cpu-used", "8",
+        "pipe:1",                 // Write to stdout
+      ], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      let ffmpegFailed = false;
+
+      // If copy codec fails for WebM, retry with VP8/VP9 encoding
+      ffmpeg.on("error", (err) => {
+        console.error("[STREAM REMUX] FFmpeg spawn error:", err.message);
+        ffmpegFailed = true;
+        if (!res.writableEnded) res.end();
+      });
+
+      ffmpeg.stderr?.on("data", (data: Buffer) => {
+        const msg = data.toString();
+        if (msg.includes("Could not write header") || msg.includes("codec not currently supported")) {
+          // Restart with VP8 encoding
+          ffmpeg.kill();
+          ffmpegFailed = true;
+          startRemuxWithTranscode();
+        }
+      });
+
+      ffmpeg.stdout?.on("data", (chunk: Buffer) => {
+        if (!res.writableEnded) res.write(chunk);
+      });
+
+      ffmpeg.on("close", () => {
+        if (!res.writableEnded) res.end();
+      });
+
+      // Feed chunks from host to FFmpeg stdin
+      let currentOffset = 0;
+      const feedChunks = async () => {
+        try {
+          while (currentOffset < fileSize && !req.destroyed && !ffmpegFailed) {
+            const readSize = Math.min(256 * 1024, fileSize - currentOffset);
+            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
+            if (ffmpeg.stdin?.writable) {
+              ffmpeg.stdin.write(chunk);
+            } else {
+              break;
+            }
+            currentOffset += readSize;
+          }
+          ffmpeg.stdin?.end();
+        } catch (err) {
+          console.error(`[STREAM REMUX ERROR]`, err);
+          ffmpeg.stdin?.end();
+          if (!res.writableEnded) res.end();
+        }
+      };
+
+      const startRemuxWithTranscode = () => {
+        console.log("[STREAM REMUX] Retrying with VP8/Opus transcoding...");
+        const ffmpeg2 = spawn(ffmpegPath, [
+          "-i", "pipe:0",
+          "-c:v", "libvpx",
+          "-b:v", "2M",
+          "-c:a", "libopus",
+          "-f", "webm",
+          "-deadline", "realtime",
+          "-cpu-used", "8",
+          "pipe:1",
+        ], {
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+
+        ffmpeg2.stdout?.on("data", (chunk: Buffer) => {
+          if (!res.writableEnded) res.write(chunk);
+        });
+
+        ffmpeg2.on("close", () => {
+          if (!res.writableEnded) res.end();
+        });
+
+        ffmpeg2.on("error", (err) => {
+          console.error("[STREAM REMUX TRANSCODE ERROR]", err.message);
+          if (!res.writableEnded) res.end();
+        });
+
+        // Re-feed from beginning
+        let offset2 = 0;
+        const feed2 = async () => {
+          try {
+            while (offset2 < fileSize && !req.destroyed) {
+              const readSize = Math.min(256 * 1024, fileSize - offset2);
+              const chunk = await requestChunkFromHost(room.hostId || "", offset2, readSize);
+              if (ffmpeg2.stdin?.writable) {
+                ffmpeg2.stdin.write(chunk);
+              } else {
+                break;
+              }
+              offset2 += readSize;
+            }
+            ffmpeg2.stdin?.end();
+          } catch (err) {
+            console.error("[STREAM REMUX TRANSCODE FEED ERROR]", err);
+            ffmpeg2.stdin?.end();
+          }
+        };
+        void feed2();
+      };
+
+      void feedChunks();
+
+      req.on("close", () => {
+        ffmpeg.kill("SIGTERM");
+      });
+      return;
+    }
+
+    // ── Standard streaming (browser-playable formats like MP4, WebM) ──
     if (range) {
       const parts = range.replace(/bytes=/, "").split("-");
       const start = parseInt(parts[0], 10);
@@ -94,7 +339,6 @@ const httpServer = createServer((req, res) => {
       if (start >= fileSize || end >= fileSize) {
         res.writeHead(416, {
           "Content-Range": `bytes */${fileSize}`,
-          "Access-Control-Allow-Origin": "*"
         });
         res.end();
         return;
@@ -105,32 +349,29 @@ const httpServer = createServer((req, res) => {
         "Content-Range": `bytes ${start}-${end}/${fileSize}`,
         "Accept-Ranges": "bytes",
         "Content-Length": chunksize,
-        "Content-Type": file.mimeType,
+        "Content-Type": file.mimeType || "video/mp4",
       });
 
       let currentOffset = start;
       const streamChunks = async () => {
         try {
           while (currentOffset <= end && !req.destroyed) {
-            const readSize = Math.min(256 * 1024, end - currentOffset + 1); // 256KB chunks
+            const readSize = Math.min(256 * 1024, end - currentOffset + 1);
             const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
-            res.write(chunk);
+            if (!res.writableEnded) res.write(chunk);
             currentOffset += readSize;
           }
-          res.end();
+          if (!res.writableEnded) res.end();
         } catch (err) {
           console.error(`[STREAM ERROR] Error streaming range to client:`, err);
-          if (!res.headersSent) {
-            res.writeHead(500);
-          }
-          res.end();
+          if (!res.writableEnded) res.end();
         }
       };
       void streamChunks();
     } else {
       res.writeHead(200, {
         "Content-Length": fileSize,
-        "Content-Type": file.mimeType,
+        "Content-Type": file.mimeType || "video/mp4",
         "Accept-Ranges": "bytes",
       });
 
@@ -140,16 +381,13 @@ const httpServer = createServer((req, res) => {
           while (currentOffset < fileSize && !req.destroyed) {
             const readSize = Math.min(256 * 1024, fileSize - currentOffset);
             const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
-            res.write(chunk);
+            if (!res.writableEnded) res.write(chunk);
             currentOffset += readSize;
           }
-          res.end();
+          if (!res.writableEnded) res.end();
         } catch (err) {
           console.error(`[STREAM ERROR] Error streaming full file to client:`, err);
-          if (!res.headersSent) {
-            res.writeHead(500);
-          }
-          res.end();
+          if (!res.writableEnded) res.end();
         }
       };
       void streamAll();
@@ -163,12 +401,15 @@ const httpServer = createServer((req, res) => {
   }
 });
 
+// ───────────── Socket.IO Server ─────────────
 const io = new Server(httpServer, {
   cors: {
-    origin: clientOrigin.split(",").map((origin) => origin.trim()),
+    origin: clientOrigin === "*" ? "*" : clientOrigin.split(",").map((origin) => origin.trim()),
     methods: ["GET", "POST"],
+    credentials: clientOrigin !== "*",
   },
   transports: ["websocket", "polling"],
+  maxHttpBufferSize: 1e7, // 10MB max for relay chunks
 });
 
 function createRoomId(): string {
@@ -226,10 +467,15 @@ io.on("connection", (socket) => {
         return;
       }
 
-      if (room.hostId && room.hostId !== socket.id) {
-        console.log(`[ROOM RESTORE FAIL] Room ${roomId} already has another host (${room.hostId}) instead of ${socket.id}`);
-        ack({ ok: false, error: "This room already has a host." });
-        return;
+      // FIX: Allow restore if the room has no active host, OR the previous host is disconnected
+      // (socket IDs change on reconnect, so comparing to old socket.id is unreliable)
+      if (room.hostId) {
+        const existingHost = io.sockets.sockets.get(room.hostId);
+        if (existingHost && existingHost.connected && existingHost.id !== socket.id) {
+          console.log(`[ROOM RESTORE FAIL] Room ${roomId} already has an active host (${room.hostId})`);
+          ack({ ok: false, error: "This room already has a host." });
+          return;
+        }
       }
 
       room.hostId = socket.id;
@@ -259,10 +505,16 @@ io.on("connection", (socket) => {
         return;
       }
 
+      // FIX: Check if existing host is actually still connected
       if (room.hostId && room.hostId !== socket.id) {
-        console.log(`[ROOM JOIN FAIL] Room ${roomId} already occupied by host ${room.hostId} (requested by ${socket.id})`);
-        ack({ ok: false, error: "This room already has a host." });
-        return;
+        const existingHost = io.sockets.sockets.get(room.hostId);
+        if (existingHost && existingHost.connected) {
+          console.log(`[ROOM JOIN FAIL] Room ${roomId} already occupied by active host ${room.hostId}`);
+          ack({ ok: false, error: "This room already has a host." });
+          return;
+        }
+        // Previous host disconnected — allow new host
+        console.log(`[ROOM JOIN] Previous host ${room.hostId} is disconnected, allowing ${socket.id}`);
       }
 
       room.hostId = socket.id;
@@ -350,13 +602,32 @@ io.on("connection", (socket) => {
       const room = rooms.get(roomId);
       if (room && room.hostId === socket.id) {
         room.file = payload.file;
-        console.log(`[FILE REGISTER] Room ${roomId} registered file: ${payload.file.name} (${payload.file.size} bytes)`);
+        console.log(`[FILE REGISTER] Room ${roomId} registered file: ${payload.file.name} (${payload.file.size} bytes, ${payload.file.mimeType})`);
+        // Notify viewer about the file
+        if (room.viewerId) {
+          io.to(room.viewerId).emit("host:file-registered" as any, {
+            name: payload.file.name,
+            size: payload.file.size,
+            mimeType: payload.file.mimeType,
+          });
+        }
       }
     }
   );
 
   socket.on("stream:respond-chunk", (payload: { requestId: string; chunk: any }) => {
     chunkEmitter.emit(payload.requestId, payload.chunk);
+  });
+
+  // ── WebSocket relay for when WebRTC fails ──
+  socket.on("relay:data", (payload: { roomId: string; data: ArrayBuffer | string }) => {
+    const room = rooms.get(payload.roomId);
+    if (!room) return;
+
+    const target = socket.data.role === "host" ? room.viewerId : room.hostId;
+    if (target) {
+      io.to(target).emit("relay:data", { data: payload.data });
+    }
   });
 
   socket.on("disconnect", () => {
@@ -384,6 +655,19 @@ io.on("connection", (socket) => {
     }
   });
 });
+
+// ───────────── Room cleanup interval ─────────────
+setInterval(() => {
+  const now = Date.now();
+  const maxAge = 2 * 60 * 60 * 1000; // 2 hours
+  for (const [id, room] of rooms) {
+    if (now - room.createdAt > maxAge) {
+      console.log(`[ROOM EXPIRE] Cleaning up stale room ${id}`);
+      io.to(roomName(id)).emit("room:closed");
+      rooms.delete(id);
+    }
+  }
+}, 10 * 60 * 1000); // Check every 10 minutes
 
 httpServer.listen(port, () => {
   console.log(`StreamLink signaling server listening on :${port}`);
