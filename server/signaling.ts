@@ -369,17 +369,25 @@ io.on("connection", (socket) => {
     if (!room) return;
 
     if (role === "viewer" && room.viewerId === socket.id) {
-      console.log(`[ROOM CLOSE] Viewer (Creator) disconnected. Closing room ${roomId}`);
-      io.to(roomName(roomId)).emit("room:closed");
-      rooms.delete(roomId);
+      room.viewerId = undefined;
+      console.log(`[ROOM LEAVE] Viewer disconnected from room ${roomId}`);
+      if (room.hostId) {
+        io.to(room.hostId).emit("peer:left");
+      } else {
+        console.log(`[ROOM CLOSE] No peers left. Deleting room ${roomId}`);
+        rooms.delete(roomId);
+      }
       return;
     }
 
     if (role === "host" && room.hostId === socket.id) {
-      console.log(`[ROOM LEAVE] Host disconnected from room ${roomId}`);
       room.hostId = undefined;
+      console.log(`[ROOM LEAVE] Host disconnected from room ${roomId}`);
       if (room.viewerId) {
         io.to(room.viewerId).emit("peer:left");
+      } else {
+        console.log(`[ROOM CLOSE] No peers left. Deleting room ${roomId}`);
+        rooms.delete(roomId);
       }
     }
   });
