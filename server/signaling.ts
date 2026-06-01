@@ -39,19 +39,37 @@ const rooms = new Map<string, Room>();
 const chunkEmitter = new EventEmitter();
 chunkEmitter.setMaxListeners(100);
 
-function requestChunkFromHost(hostSocketId: string, offset: number, size: number): Promise<Buffer> {
+function requestChunkFromHost(
+  hostSocketId: string,
+  offset: number,
+  size: number,
+  req: any
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
+    if (req.destroyed) {
+      return reject(new Error("Request already destroyed"));
+    }
+
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
     const onChunk = (chunk: any) => {
+      req.off("close", onClose);
       clearTimeout(timer);
       resolve(Buffer.from(chunk));
     };
 
+    const onClose = () => {
+      chunkEmitter.off(requestId, onChunk);
+      clearTimeout(timer);
+      reject(new Error("Client connection closed"));
+    };
+
     chunkEmitter.once(requestId, onChunk);
+    req.once("close", onClose);
 
     const timer = setTimeout(() => {
       chunkEmitter.off(requestId, onChunk);
+      req.off("close", onClose);
       reject(new Error("Timeout waiting for chunk from host"));
     }, 15000);
 
@@ -113,7 +131,7 @@ const httpServer = createServer((req, res) => {
         try {
           while (currentOffset <= end && !req.destroyed) {
             const readSize = Math.min(256 * 1024, end - currentOffset + 1); // 256KB chunks
-            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
+            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize, req);
             res.write(chunk);
             currentOffset += readSize;
           }
@@ -139,7 +157,7 @@ const httpServer = createServer((req, res) => {
         try {
           while (currentOffset < fileSize && !req.destroyed) {
             const readSize = Math.min(256 * 1024, fileSize - currentOffset);
-            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
+            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize, req);
             res.write(chunk);
             currentOffset += readSize;
           }
