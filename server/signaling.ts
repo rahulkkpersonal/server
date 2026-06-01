@@ -66,11 +66,9 @@ try {
   // ffmpeg-static not available, try system ffmpeg
 }
 
-/** 
- * Check if a file format needs remuxing for browser playback.
- * Uses an allowlist approach: only formats known to be browser-native are allowed through.
- * Everything else gets transcoded to fragmented MP4 via FFmpeg.
- */
+/** Check if a file format needs remuxing for browser playback.
+ *  Uses a whitelist approach: only MP4, WebM, and OGG are natively browser-playable.
+ *  Everything else (MKV, AVI, WMV, FLV, MOV, TS, HEVC, DIVX, VOB, etc.) gets remuxed. */
 function needsRemux(mimeType: string): boolean {
   const browserNativeTypes = [
     "video/mp4",
@@ -195,9 +193,9 @@ const httpServer = createServer((req, res) => {
       return;
     }
 
-    // ── If the format needs remuxing (MKV, AVI, etc.) → pipe through FFmpeg as fragmented MP4 ──
+    // ── If the format needs remuxing → pipe through FFmpeg to fragmented MP4 (H.264/AAC) ──
     if (shouldRemux) {
-      console.log(`[STREAM REMUX] Transcoding ${file.name} (${file.mimeType}) to fragmented MP4 for browser playback`);
+      console.log(`[STREAM REMUX] Transcoding ${file.name} (${file.mimeType}) to MP4 (H.264/AAC) for browser playback`);
 
       res.writeHead(200, {
         "Content-Type": "video/mp4",
@@ -206,85 +204,125 @@ const httpServer = createServer((req, res) => {
         "Cache-Control": "no-store",
       });
 
-      // Spawn FFmpeg to transcode to fragmented MP4 (H.264 + AAC)
-      // Fragmented MP4 (fMP4) is streamable — no need for moov atom at the end
-      // Every browser supports H.264/AAC in MP4 container
-      const ffmpegArgs = [
-        "-i", "pipe:0",                          // Read from stdin
-        "-c:v", "libx264",                       // H.264 video (universally supported)
-        "-preset", "ultrafast",                   // Fastest encoding speed
-        "-tune", "zerolatency",                   // Low-latency encoding
-        "-crf", "23",                             // Good quality
-        "-c:a", "aac",                            // AAC audio (universally supported)
-        "-b:a", "128k",                           // Audio bitrate
-        "-ac", "2",                               // Stereo audio
-        "-movflags", "frag_keyframe+empty_moov+default_base_moof",  // Fragmented MP4 for streaming
-        "-f", "mp4",                              // Output MP4 format
-        "-pix_fmt", "yuv420p",                    // Compatible pixel format
-        "pipe:1",                                 // Write to stdout
-      ];
+      let ffmpegFailed = false;
+      let ffmpegProcess: ReturnType<typeof spawn> | null = null;
 
-      const ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+      const startFfmpeg = (transcode: boolean) => {
+        const args = [
+          "-i", "pipe:0",             // Read from stdin
+          "-map", "0:v:0?",           // First video stream (optional)
+          "-map", "0:a:0?",           // First audio stream (optional)
+          ...(transcode
+            ? ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-tune", "zerolatency"]
+            : ["-c:v", "copy"]),
+          ...(transcode
+            ? ["-c:a", "aac", "-b:a", "128k"]
+            : ["-c:a", "aac", "-b:a", "128k"]),   // Always re-encode audio to AAC for MP4 compat
+          "-f", "mp4",
+          "-movflags", "frag_keyframe+empty_moov+default_base_moof",  // Fragmented MP4 for streaming
+          "-pix_fmt", "yuv420p",       // Ensure compatible pixel format
+          "pipe:1",                    // Write to stdout
+        ];
 
-      let ffmpegErrored = false;
+        const proc = spawn(ffmpegPath, args, {
+          stdio: ["pipe", "pipe", "pipe"],
+        });
 
-      ffmpeg.on("error", (err) => {
-        console.error("[STREAM REMUX] FFmpeg spawn error:", err.message);
-        ffmpegErrored = true;
-        if (!res.writableEnded) res.end();
-      });
-
-      ffmpeg.stderr?.on("data", (data: Buffer) => {
-        // Log FFmpeg progress but don't treat stderr output as errors
-        // FFmpeg writes progress info to stderr normally
-        const msg = data.toString().trim();
-        if (msg.includes("Error") || msg.includes("error")) {
-          console.error("[STREAM REMUX STDERR]", msg);
-        }
-      });
-
-      ffmpeg.stdout?.on("data", (chunk: Buffer) => {
-        if (!res.writableEnded && !ffmpegErrored) {
-          const ok = res.write(chunk);
-          if (!ok) {
-            // Backpressure: wait for drain before continuing
-            ffmpeg.stdout?.pause();
-            res.once("drain", () => {
-              ffmpeg.stdout?.resume();
-            });
+        proc.stdout?.on("data", (chunk: Buffer) => {
+          if (!res.writableEnded) {
+            const ok = res.write(chunk);
+            if (!ok) {
+              proc.stdout?.pause();
+              res.once("drain", () => proc.stdout?.resume());
+            }
           }
-        }
-      });
+        });
 
-      ffmpeg.on("close", (code) => {
-        console.log(`[STREAM REMUX] FFmpeg process closed with code ${code}`);
-        if (!res.writableEnded) res.end();
-      });
+        proc.on("close", (code) => {
+          console.log(`[STREAM REMUX] FFmpeg exited with code ${code}${transcode ? " (transcode)" : " (copy)"}`);
+          if (!res.writableEnded) res.end();
+        });
+
+        proc.on("error", (err) => {
+          console.error("[STREAM REMUX] FFmpeg spawn error:", err.message);
+          ffmpegFailed = true;
+          if (!res.writableEnded) res.end();
+        });
+
+        // Watch stderr for codec incompatibility → retry with full transcode
+        if (!transcode) {
+          proc.stderr?.on("data", (data: Buffer) => {
+            const msg = data.toString();
+            if (
+              !ffmpegFailed &&
+              (msg.includes("Could not write header") ||
+               msg.includes("codec not currently supported") ||
+               msg.includes("could not find codec") ||
+               msg.includes("Discarding ID3 tags") === false && msg.includes("Error"))
+            ) {
+              // Only trigger retry for real codec errors, not warnings
+              if (msg.includes("Could not write header") || msg.includes("codec not currently supported")) {
+                console.log("[STREAM REMUX] Copy codec failed, retrying with H.264/AAC transcode...");
+                ffmpegFailed = true;
+                proc.kill();
+                // Start a new FFmpeg with full transcode
+                startTranscodePass();
+              }
+            }
+          });
+        }
+
+        return proc;
+      };
+
+      const startTranscodePass = () => {
+        ffmpegFailed = false;
+        ffmpegProcess = startFfmpeg(true);
+
+        // Re-feed from beginning
+        let offset2 = 0;
+        const feed2 = async () => {
+          try {
+            while (offset2 < fileSize && !req.destroyed && !ffmpegFailed) {
+              const readSize = Math.min(256 * 1024, fileSize - offset2);
+              const chunk = await requestChunkFromHost(room.hostId || "", offset2, readSize);
+              if (ffmpegProcess?.stdin?.writable) {
+                ffmpegProcess.stdin.write(chunk);
+              } else {
+                break;
+              }
+              offset2 += readSize;
+            }
+            ffmpegProcess?.stdin?.end();
+          } catch (err) {
+            console.error("[STREAM REMUX TRANSCODE FEED ERROR]", err);
+            ffmpegProcess?.stdin?.end();
+          }
+        };
+        void feed2();
+      };
+
+      // Start with copy mode first (fast)
+      ffmpegProcess = startFfmpeg(false);
 
       // Feed chunks from host to FFmpeg stdin
       let currentOffset = 0;
       const feedChunks = async () => {
         try {
-          while (currentOffset < fileSize && !req.destroyed && !ffmpegErrored) {
+          while (currentOffset < fileSize && !req.destroyed && !ffmpegFailed) {
             const readSize = Math.min(256 * 1024, fileSize - currentOffset);
             const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
-            if (ffmpeg.stdin?.writable && !ffmpegErrored) {
-              const canWrite = ffmpeg.stdin.write(chunk);
-              if (!canWrite) {
-                // Wait for FFmpeg stdin to drain before writing more
-                await new Promise<void>((resolve) => ffmpeg.stdin!.once("drain", resolve));
-              }
+            if (ffmpegProcess?.stdin?.writable) {
+              ffmpegProcess.stdin.write(chunk);
             } else {
               break;
             }
             currentOffset += readSize;
           }
-          if (ffmpeg.stdin?.writable) ffmpeg.stdin.end();
+          ffmpegProcess?.stdin?.end();
         } catch (err) {
           console.error(`[STREAM REMUX ERROR]`, err);
-          if (ffmpeg.stdin?.writable) ffmpeg.stdin.end();
+          ffmpegProcess?.stdin?.end();
           if (!res.writableEnded) res.end();
         }
       };
@@ -292,7 +330,7 @@ const httpServer = createServer((req, res) => {
       void feedChunks();
 
       req.on("close", () => {
-        if (!ffmpeg.killed) ffmpeg.kill("SIGTERM");
+        ffmpegProcess?.kill("SIGTERM");
       });
       return;
     }
