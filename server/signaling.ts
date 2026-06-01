@@ -66,20 +66,18 @@ try {
   // ffmpeg-static not available, try system ffmpeg
 }
 
-/** Check if a file format needs remuxing for browser playback */
+/** 
+ * Check if a file format needs remuxing for browser playback.
+ * Uses an allowlist approach: only formats known to be browser-native are allowed through.
+ * Everything else gets transcoded to fragmented MP4 via FFmpeg.
+ */
 function needsRemux(mimeType: string): boolean {
-  const nonBrowserTypes = [
-    "video/x-matroska",
-    "video/x-msvideo",
-    "video/x-ms-wmv",
-    "video/x-flv",
-    "video/quicktime",
-    "video/hevc",
-    "video/mpeg",
-    "video/mp2t",
-    "video/octet-stream",
+  const browserNativeTypes = [
+    "video/mp4",
+    "video/webm",
+    "video/ogg",
   ];
-  return nonBrowserTypes.includes(mimeType);
+  return !browserNativeTypes.includes(mimeType);
 }
 
 // ───────────── Chunk request from host ─────────────
@@ -197,55 +195,71 @@ const httpServer = createServer((req, res) => {
       return;
     }
 
-    // ── If the format needs remuxing (MKV, AVI, etc.) → pipe through FFmpeg ──
+    // ── If the format needs remuxing (MKV, AVI, etc.) → pipe through FFmpeg as fragmented MP4 ──
     if (shouldRemux) {
-      console.log(`[STREAM REMUX] Remuxing ${file.name} (${file.mimeType}) to WebM for browser playback`);
+      console.log(`[STREAM REMUX] Transcoding ${file.name} (${file.mimeType}) to fragmented MP4 for browser playback`);
 
       res.writeHead(200, {
-        "Content-Type": "video/webm",
+        "Content-Type": "video/mp4",
         "Accept-Ranges": "none",
         "Transfer-Encoding": "chunked",
         "Cache-Control": "no-store",
       });
 
-      // Spawn FFmpeg to remux from input format to WebM (fast remux, no re-encode if possible)
-      const ffmpeg = spawn(ffmpegPath, [
-        "-i", "pipe:0",           // Read from stdin
-        "-c:v", "copy",           // Try to copy video codec first
-        "-c:a", "opus",           // Transcode audio to opus (WebM compatible)
-        "-f", "webm",             // Output WebM format
-        "-movflags", "+faststart",
-        "-deadline", "realtime",
-        "-cpu-used", "8",
-        "pipe:1",                 // Write to stdout
-      ], {
+      // Spawn FFmpeg to transcode to fragmented MP4 (H.264 + AAC)
+      // Fragmented MP4 (fMP4) is streamable — no need for moov atom at the end
+      // Every browser supports H.264/AAC in MP4 container
+      const ffmpegArgs = [
+        "-i", "pipe:0",                          // Read from stdin
+        "-c:v", "libx264",                       // H.264 video (universally supported)
+        "-preset", "ultrafast",                   // Fastest encoding speed
+        "-tune", "zerolatency",                   // Low-latency encoding
+        "-crf", "23",                             // Good quality
+        "-c:a", "aac",                            // AAC audio (universally supported)
+        "-b:a", "128k",                           // Audio bitrate
+        "-ac", "2",                               // Stereo audio
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",  // Fragmented MP4 for streaming
+        "-f", "mp4",                              // Output MP4 format
+        "-pix_fmt", "yuv420p",                    // Compatible pixel format
+        "pipe:1",                                 // Write to stdout
+      ];
+
+      const ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
         stdio: ["pipe", "pipe", "pipe"],
       });
 
-      let ffmpegFailed = false;
+      let ffmpegErrored = false;
 
-      // If copy codec fails for WebM, retry with VP8/VP9 encoding
       ffmpeg.on("error", (err) => {
         console.error("[STREAM REMUX] FFmpeg spawn error:", err.message);
-        ffmpegFailed = true;
+        ffmpegErrored = true;
         if (!res.writableEnded) res.end();
       });
 
       ffmpeg.stderr?.on("data", (data: Buffer) => {
-        const msg = data.toString();
-        if (msg.includes("Could not write header") || msg.includes("codec not currently supported")) {
-          // Restart with VP8 encoding
-          ffmpeg.kill();
-          ffmpegFailed = true;
-          startRemuxWithTranscode();
+        // Log FFmpeg progress but don't treat stderr output as errors
+        // FFmpeg writes progress info to stderr normally
+        const msg = data.toString().trim();
+        if (msg.includes("Error") || msg.includes("error")) {
+          console.error("[STREAM REMUX STDERR]", msg);
         }
       });
 
       ffmpeg.stdout?.on("data", (chunk: Buffer) => {
-        if (!res.writableEnded) res.write(chunk);
+        if (!res.writableEnded && !ffmpegErrored) {
+          const ok = res.write(chunk);
+          if (!ok) {
+            // Backpressure: wait for drain before continuing
+            ffmpeg.stdout?.pause();
+            res.once("drain", () => {
+              ffmpeg.stdout?.resume();
+            });
+          }
+        }
       });
 
-      ffmpeg.on("close", () => {
+      ffmpeg.on("close", (code) => {
+        console.log(`[STREAM REMUX] FFmpeg process closed with code ${code}`);
         if (!res.writableEnded) res.end();
       });
 
@@ -253,79 +267,32 @@ const httpServer = createServer((req, res) => {
       let currentOffset = 0;
       const feedChunks = async () => {
         try {
-          while (currentOffset < fileSize && !req.destroyed && !ffmpegFailed) {
+          while (currentOffset < fileSize && !req.destroyed && !ffmpegErrored) {
             const readSize = Math.min(256 * 1024, fileSize - currentOffset);
             const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
-            if (ffmpeg.stdin?.writable) {
-              ffmpeg.stdin.write(chunk);
+            if (ffmpeg.stdin?.writable && !ffmpegErrored) {
+              const canWrite = ffmpeg.stdin.write(chunk);
+              if (!canWrite) {
+                // Wait for FFmpeg stdin to drain before writing more
+                await new Promise<void>((resolve) => ffmpeg.stdin!.once("drain", resolve));
+              }
             } else {
               break;
             }
             currentOffset += readSize;
           }
-          ffmpeg.stdin?.end();
+          if (ffmpeg.stdin?.writable) ffmpeg.stdin.end();
         } catch (err) {
           console.error(`[STREAM REMUX ERROR]`, err);
-          ffmpeg.stdin?.end();
+          if (ffmpeg.stdin?.writable) ffmpeg.stdin.end();
           if (!res.writableEnded) res.end();
         }
-      };
-
-      const startRemuxWithTranscode = () => {
-        console.log("[STREAM REMUX] Retrying with VP8/Opus transcoding...");
-        const ffmpeg2 = spawn(ffmpegPath, [
-          "-i", "pipe:0",
-          "-c:v", "libvpx",
-          "-b:v", "2M",
-          "-c:a", "libopus",
-          "-f", "webm",
-          "-deadline", "realtime",
-          "-cpu-used", "8",
-          "pipe:1",
-        ], {
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-
-        ffmpeg2.stdout?.on("data", (chunk: Buffer) => {
-          if (!res.writableEnded) res.write(chunk);
-        });
-
-        ffmpeg2.on("close", () => {
-          if (!res.writableEnded) res.end();
-        });
-
-        ffmpeg2.on("error", (err) => {
-          console.error("[STREAM REMUX TRANSCODE ERROR]", err.message);
-          if (!res.writableEnded) res.end();
-        });
-
-        // Re-feed from beginning
-        let offset2 = 0;
-        const feed2 = async () => {
-          try {
-            while (offset2 < fileSize && !req.destroyed) {
-              const readSize = Math.min(256 * 1024, fileSize - offset2);
-              const chunk = await requestChunkFromHost(room.hostId || "", offset2, readSize);
-              if (ffmpeg2.stdin?.writable) {
-                ffmpeg2.stdin.write(chunk);
-              } else {
-                break;
-              }
-              offset2 += readSize;
-            }
-            ffmpeg2.stdin?.end();
-          } catch (err) {
-            console.error("[STREAM REMUX TRANSCODE FEED ERROR]", err);
-            ffmpeg2.stdin?.end();
-          }
-        };
-        void feed2();
       };
 
       void feedChunks();
 
       req.on("close", () => {
-        ffmpeg.kill("SIGTERM");
+        if (!ffmpeg.killed) ffmpeg.kill("SIGTERM");
       });
       return;
     }
