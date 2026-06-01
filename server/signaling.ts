@@ -1,5 +1,7 @@
 import { createServer } from "node:http";
 import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
+import ffmpegPath from "ffmpeg-static";
 import { Server, type Socket } from "socket.io";
 
 type Room = {
@@ -101,6 +103,91 @@ const httpServer = createServer((req, res) => {
     if (req.method === "OPTIONS") {
       res.writeHead(200);
       res.end();
+      return;
+    }
+
+    const nonNativeContainers = [".mkv", ".avi", ".flv", ".wmv", ".ts", ".mov", ".mpg", ".mpeg", ".hevc"];
+    const isNonNative = file.name && nonNativeContainers.some(ext => file.name.toLowerCase().endsWith(ext));
+
+    if (isNonNative) {
+      if (!ffmpegPath) {
+        console.error("[TRANSCODE ERROR] ffmpeg-static path is not found.");
+        res.writeHead(500, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+        res.end("Transcoding service not available.");
+        return;
+      }
+
+      res.writeHead(200, {
+        "Content-Type": "video/mp4",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      });
+
+      console.log(`[TRANSCODE START] Spawning FFmpeg to remux/transcode non-native file: ${file.name}`);
+
+      const ffmpeg = spawn(ffmpegPath, [
+        "-i", "pipe:0", // Read input from stdin
+        "-c:v", "copy", // Copy video track (highly efficient!)
+        "-c:a", "aac",  // Transcode audio to AAC (highly compatible)
+        "-b:a", "128k", // Audio bitrate
+        "-ac", "2",     // Stereo audio
+        "-f", "mp4",    // Fragmented MP4 output format
+        "-movflags", "empty_moov+omit_tfhd_offset+frag_keyframe+default_base_moof", // Streamable MP4 flags
+        "pipe:1"        // Write output to stdout
+      ]);
+
+      ffmpeg.stdout.pipe(res);
+
+      ffmpeg.on("error", (err) => {
+        console.error("[FFMPEG PROCESS ERROR]", err);
+        if (!res.headersSent) {
+          res.writeHead(500);
+        }
+        res.end();
+      });
+
+      let currentOffset = 0;
+      let isFeederRunning = true;
+
+      const feedFfmpeg = async () => {
+        try {
+          while (currentOffset < fileSize && !req.destroyed && isFeederRunning) {
+            if (!ffmpeg.stdin.writable) {
+              console.log("[TRANSCODE FEED] FFmpeg stdin is no longer writable.");
+              break;
+            }
+
+            const readSize = Math.min(256 * 1024, fileSize - currentOffset);
+            const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize, req);
+
+            const canWrite = ffmpeg.stdin.write(chunk);
+            if (!canWrite) {
+              await new Promise<void>((resolve) => {
+                ffmpeg.stdin.once("drain", resolve);
+              });
+            }
+
+            currentOffset += readSize;
+          }
+          if (ffmpeg.stdin.writable) {
+            ffmpeg.stdin.end();
+          }
+        } catch (err) {
+          console.error("[TRANSCODE FEED ERROR]", err);
+          isFeederRunning = false;
+          ffmpeg.kill();
+          res.end();
+        }
+      };
+
+      void feedFfmpeg();
+
+      req.on("close", () => {
+        console.log("[TRANSCODE END] Client closed connection. Killing FFmpeg process.");
+        isFeederRunning = false;
+        ffmpeg.kill();
+      });
+
       return;
     }
 
