@@ -441,7 +441,7 @@ io.on("connection", (socket) => {
 
   socket.on("room:create", (ack: (response: { roomId: string }) => void) => {
     const roomId = createRoomId();
-    rooms.set(roomId, { hostId: "", viewerId: socket.id, createdAt: Date.now() });
+    rooms.set(roomId, { hostId: undefined, viewerId: socket.id, createdAt: Date.now() });
     bindSocket(socket, roomId, "viewer");
     console.log(`[ROOM CREATE] Viewer (Creator) ${socket.id} created room ${roomId}`);
     ack({ roomId });
@@ -459,7 +459,12 @@ io.on("connection", (socket) => {
       const room = rooms.get(roomId);
 
       if (payload.role === "viewer") {
-        rooms.set(roomId, { hostId: room?.hostId || "", viewerId: socket.id, createdAt: Date.now(), file: room?.file });
+        if (room) {
+          // Update existing room in-place — preserve createdAt and file
+          room.viewerId = socket.id;
+        } else {
+          rooms.set(roomId, { hostId: undefined, viewerId: socket.id, createdAt: Date.now() });
+        }
         bindSocket(socket, roomId, "viewer");
         console.log(`[ROOM RESTORE SUCCESS] Viewer ${socket.id} restored room ${roomId}`);
         ack({ ok: true });
