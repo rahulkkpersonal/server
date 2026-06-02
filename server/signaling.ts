@@ -183,7 +183,12 @@ const httpServer = createServer((req, res) => {
     const file = room.file;
     const fileSize = file.size;
     const range = req.headers.range;
-    const shouldRemux = needsRemux(file.mimeType);
+    const userAgent = req.headers["user-agent"] || "";
+    // Only remux for browsers (which have 'Mozilla' in UA) and if raw stream is not explicitly requested.
+    // External media players like VLC/MX Player can play raw MKV/AVI natively and get full seek support.
+    const isBrowser = userAgent.includes("Mozilla");
+    const isRawRequested = url.includes("raw=true");
+    const shouldRemux = needsRemux(file.mimeType) && isBrowser && !isRawRequested;
 
     setCorsHeaders(res, req);
 
