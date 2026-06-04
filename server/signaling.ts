@@ -13,6 +13,7 @@ type Room = {
     size: number;
     mimeType: string;
   };
+  activeStreamsCount?: number;
 };
 
 type SessionDescription = {
@@ -179,6 +180,28 @@ const httpServer = createServer((req, res) => {
       res.end("Host is not currently online.");
       return;
     }
+
+    // Track active HTTP streams
+    if (typeof room.activeStreamsCount !== "number") {
+      room.activeStreamsCount = 0;
+    }
+    room.activeStreamsCount++;
+    console.log(`[HTTP STREAM] New request for room ${roomId}. Active streams: ${room.activeStreamsCount}`);
+
+    let streamClosed = false;
+    const cleanupStream = () => {
+      if (streamClosed) return;
+      streamClosed = true;
+      const currentRoom = rooms.get(roomId);
+      if (currentRoom) {
+        currentRoom.activeStreamsCount = Math.max(0, (currentRoom.activeStreamsCount || 1) - 1);
+        console.log(`[HTTP STREAM] Connection closed for room ${roomId}. Active streams: ${currentRoom.activeStreamsCount}`);
+      }
+      checkRoomCleanup(roomId);
+    };
+
+    req.on("close", cleanupStream);
+    res.on("finish", cleanupStream);
 
     const file = room.file;
     const fileSize = file.size;
@@ -422,6 +445,26 @@ const io = new Server(httpServer, {
   maxHttpBufferSize: 1e7, // 10MB max for relay chunks
 });
 
+// Robust room cleanup with grace period to handle transient disconnects or app-switching (e.g. to VLC)
+function checkRoomCleanup(roomId: string) {
+  setTimeout(() => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    const hasViewer = room.viewerId && io.sockets.sockets.get(room.viewerId)?.connected;
+    const hasHost = room.hostId && io.sockets.sockets.get(room.hostId)?.connected;
+    const hasActiveStreams = typeof room.activeStreamsCount === "number" && room.activeStreamsCount > 0;
+
+    console.log(`[ROOM CLEANUP CHECK] Room ${roomId} status — Has Viewer: ${!!hasViewer}, Has Host: ${!!hasHost}, Active Streams: ${room.activeStreamsCount || 0}`);
+
+    if (!hasViewer && !hasHost && !hasActiveStreams) {
+      console.log(`[ROOM CLOSE] No active hosts, viewers, or HTTP streams for room ${roomId}. Deleting room.`);
+      io.to(roomName(roomId)).emit("room:closed");
+      rooms.delete(roomId);
+    }
+  }, 10000); // 10 seconds grace period
+}
+
 function createRoomId(): string {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let id = "";
@@ -655,9 +698,12 @@ io.on("connection", (socket) => {
     if (!room) return;
 
     if (role === "viewer" && room.viewerId === socket.id) {
-      console.log(`[ROOM CLOSE] Viewer (Creator) disconnected. Closing room ${roomId}`);
-      io.to(roomName(roomId)).emit("room:closed");
-      rooms.delete(roomId);
+      console.log(`[ROOM LEAVE] Viewer disconnected from room ${roomId}`);
+      room.viewerId = undefined;
+      if (room.hostId) {
+        io.to(room.hostId).emit("peer:left");
+      }
+      checkRoomCleanup(roomId);
       return;
     }
 
@@ -667,6 +713,7 @@ io.on("connection", (socket) => {
       if (room.viewerId) {
         io.to(room.viewerId).emit("peer:left");
       }
+      checkRoomCleanup(roomId);
     }
   });
 });
