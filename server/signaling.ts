@@ -391,7 +391,15 @@ const httpServer = createServer((req, res) => {
           while (currentOffset <= end && !req.destroyed) {
             const readSize = Math.min(256 * 1024, end - currentOffset + 1);
             const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
-            if (!res.writableEnded) res.write(chunk);
+            if (!res.writableEnded) {
+              const ok = res.write(chunk);
+              if (!ok && !req.destroyed) {
+                await new Promise<void>((resolve) => {
+                  res.once("drain", resolve);
+                  req.once("close", resolve);
+                });
+              }
+            }
             currentOffset += readSize;
           }
           if (!res.writableEnded) res.end();
@@ -414,7 +422,15 @@ const httpServer = createServer((req, res) => {
           while (currentOffset < fileSize && !req.destroyed) {
             const readSize = Math.min(256 * 1024, fileSize - currentOffset);
             const chunk = await requestChunkFromHost(room.hostId || "", currentOffset, readSize);
-            if (!res.writableEnded) res.write(chunk);
+            if (!res.writableEnded) {
+              const ok = res.write(chunk);
+              if (!ok && !req.destroyed) {
+                await new Promise<void>((resolve) => {
+                  res.once("drain", resolve);
+                  req.once("close", resolve);
+                });
+              }
+            }
             currentOffset += readSize;
           }
           if (!res.writableEnded) res.end();
